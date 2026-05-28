@@ -80,6 +80,15 @@ _ALLOWED_CAST_ENCODINGS = {
 }
 
 
+# Fallback mapping for HF checkpoints that ship a populated ``model_type`` but
+# leave the ``architectures`` field unset (e.g. ``AntonV/mamba2-130m-hf``).
+# Keep entries here narrow — they should only cover ``model_type`` values
+# that map unambiguously to one registered ``SupportedArchitecture.name``.
+_MODEL_TYPE_TO_ARCHITECTURE: dict[str, str] = {
+    "mamba2": "Mamba2ForCausalLM",
+}
+
+
 class MAXModelConfigBase(ConfigFileModel):
     """Abstract base class for MAX model configuration.
 
@@ -853,13 +862,22 @@ class MAXModelConfig(MAXModelConfigBase):
         """Returns the architecture class name from the HuggingFace config.
 
         For transformers models, returns ``architectures[0]`` from the
-        HuggingFace config.
+        HuggingFace config. Some HF-flavored checkpoints (e.g.
+        ``AntonV/mamba2-130m-hf``) ship a config with ``model_type`` set
+        but ``architectures`` unset; in that case we fall back to a
+        ``model_type -> architecture-class`` mapping so the registry
+        lookup still resolves.
         """
         hf_config = self.huggingface_config
         if hf_config is not None:
             architectures = getattr(hf_config, "architectures", None)
             if architectures:
                 return architectures[0]
+            model_type = getattr(hf_config, "model_type", None)
+            if model_type is not None:
+                fallback = _MODEL_TYPE_TO_ARCHITECTURE.get(model_type)
+                if fallback is not None:
+                    return fallback
         return None
 
     @computed_field  # type: ignore[prop-decorator]

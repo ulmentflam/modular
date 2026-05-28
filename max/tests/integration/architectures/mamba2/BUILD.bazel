@@ -1,0 +1,97 @@
+load(
+    "//bazel:api.bzl",
+    "modular_py_test",
+    "requirement",
+)
+
+package(default_visibility = [
+    "//:__pkg__",
+    "//SDK/integration-test:__subpackages__",
+    "//max/tests:__subpackages__",
+    "//oss/modular/max/tests:__subpackages__",
+])
+
+# Graph-construction smoke test for the Mamba2 SSD functional-op wrapper.
+# The underlying ssd_chunk_scan_combined kernel is currently CPU-only;
+# the GPU dispatch raises explicitly until later RFC 0002 phases, so this
+# target does not require GPU. The state_space mojo package is registered
+# via mojo_deps so ops.custom("ssd_chunk_scan_combined", ...) resolves at
+# graph-verification time without needing custom_extensions paths.
+modular_py_test(
+    name = "test_mamba2_functional_ops",
+    size = "medium",
+    srcs = ["test_mamba2_functional_ops.py"],
+    mojo_deps = [
+        "//max:state_space",
+    ],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/pipelines/architectures",
+        requirement("numpy"),
+    ],
+)
+
+# GPU smoke for the SSD op (host-staged dispatch). Skipped on CPU-only hosts.
+modular_py_test(
+    name = "test_mamba2_ssd_gpu_smoke",
+    size = "medium",
+    srcs = ["test_mamba2_ssd_gpu_smoke.py"],
+    exec_properties = {
+        "test.resources:gpu-memory": "1",
+    },
+    gpu_constraints = ["//:has_gpu"] + select({
+        "//:apple_gpu": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    mojo_deps = [
+        "//max:state_space",
+    ],
+    tags = ["gpu"],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/pipelines/architectures",
+        requirement("numpy"),
+    ],
+)
+
+# End-to-end greedy + stochastic parity vs. the upstream ``mamba_ssm``
+# reference. Both tests are currently xfail(run=False) — see the module
+# docstring for the two upstream blockers. The target is wired up
+# regardless so that once those clear, removing the xfail markers is the
+# only change required to start running on CI.
+modular_py_test(
+    name = "test_mamba2_parity",
+    size = "enormous",
+    srcs = ["test_mamba2_parity.py"],
+    exec_properties = {
+        "test.resources:gpu-memory": "2",
+    },
+    gpu_constraints = ["//:has_gpu"] + select({
+        "//:apple_gpu": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    tags = [
+        "gpu",
+        "manual",  # parked behind upstream final_state-conv-tail follow-up
+        "no-sandbox",
+        "requires-network",
+    ],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/pipelines/architectures",
+        "//max/python/max/pipelines/lib",
+        "//max/python/max/pipelines/modeling",
+        requirement("numpy"),
+        requirement("torch"),
+        requirement("transformers"),
+    ],
+)

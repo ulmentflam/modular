@@ -29,7 +29,14 @@ from state_space.causal_conv1d import silu
 # ===----------------------------------------------------------------------=== #
 
 comptime LOG2E = 1.4426950408889634  # For converting exp to exp2 (faster on GPU)
-comptime MAX_DSTATE = 16
+# Bumped from 16 -> 128 to admit Mamba2's d_state=128 decode path. Mamba1
+# callers (d_state in {8, 16}) still work — they only use the leading
+# elements of each SIMD register and never read past their compile-time
+# DSTATE_VAL. Trade-off: every state SIMD now occupies 8x the registers
+# of the d_state=16 case, which can spill on small GPUs. If Mamba1 perf
+# regresses materially we should parameterize MAX_DSTATE on DSTATE_VAL
+# rather than carry both costs.
+comptime MAX_DSTATE = 128
 
 # Stride types for passing tensor strides to kernels
 comptime Strides1D = IndexList[1]
