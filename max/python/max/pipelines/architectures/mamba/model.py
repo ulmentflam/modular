@@ -161,6 +161,67 @@ class MambaModel(PipelineModelWithKVCache[TextContext]):
             page_size=128,
         )
 
+    @classmethod
+    def estimate_activation_memory(
+        cls,
+        pipeline_config: PipelineConfig,
+        huggingface_config: AutoConfig,
+    ) -> int:
+        """Reserve GPU memory for the per-request SSM state pool.
+
+        Mirrors the GatedDeltaNetStateCache pattern from
+        :mod:`max.pipelines.architectures.qwen3_5`. Mamba1's KV cache is a
+        dummy stub (see :meth:`get_kv_params`); the real per-request state
+        lives in :class:`SSMStateCache`. Without surfacing the pool size
+        here, the pipeline's memory estimator treats the SSM cache as
+        free memory and over-allocates the dummy KV budget, which can
+        push the eventual SSM-pool allocation off-budget for large models
+        (e.g. mamba-2.8b on a 24GB GPU).
+
+        Per slot, per layer:
+
+        * ``conv_state``: ``intermediate_size * conv_kernel`` elements
+        * ``ssm_state``:  ``intermediate_size * d_state`` elements
+
+        Pool = ``max_batch_size * num_layers * (conv + ssm) * dtype_bytes``.
+        """
+        from max.pipelines.lib import supported_encoding_dtype
+
+        # Extract the same shape fields ``MambaConfig.initialize_from_config``
+        # reads from the HF config, so this stays in sync if the config
+        # adapter learns new fallbacks.
+        hidden_size: int = int(
+            getattr(huggingface_config, "hidden_size", None)
+            or getattr(huggingface_config, "d_model", 2560)
+            or 2560
+        )
+        expand = int(getattr(huggingface_config, "expand", 2))
+        intermediate_raw = (
+            getattr(huggingface_config, "intermediate_size", None)
+            or getattr(huggingface_config, "d_inner", None)
+            or getattr(huggingface_config, "d_intermediate", None)
+        )
+        intermediate_size: int = (
+            int(intermediate_raw) if intermediate_raw else expand * hidden_size
+        )
+        d_state = int(getattr(huggingface_config, "state_size", 16))
+        conv_kernel = int(getattr(huggingface_config, "conv_kernel", 4))
+        num_layers = MambaConfig.get_num_layers(huggingface_config)
+
+        encoding = pipeline_config.model.quantization_encoding
+        state_dtype = (
+            supported_encoding_dtype(encoding)
+            if encoding is not None
+            else DType.float32
+        )
+        dtype_bytes = state_dtype.size_in_bytes
+
+        max_batch = pipeline_config.runtime.max_batch_size or 1
+        per_layer_bytes = (
+            intermediate_size * (conv_kernel + d_state) * dtype_bytes
+        )
+        return max_batch * num_layers * per_layer_bytes
+
     def _load_logprobs_model(self, session: InferenceSession) -> Model:
         graph = log_probabilities_ragged_graph(
             DeviceRef.from_device(self.logprobs_device), levels=3
