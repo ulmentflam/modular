@@ -11,7 +11,7 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std.math import ceildiv, exp
+from std.math import exp
 
 from std.gpu.host import DeviceContext
 from layout import (
@@ -22,7 +22,12 @@ from layout import (
     row_major,
 )
 from std.random import rand
-from state_space.ssd_chunk import ssd_intra_chunk_fwd_gpu
+from state_space.ssd_chunk import (
+    ssd_intra_chunk_fwd_gpu,
+    ssd_intra_chunk_fwd_gpu_naive,
+    ssd_intra_chunk_fwd_gpu_static,
+    ssd_intra_chunk_fwd_gpu_static_mma,
+)
 from std.testing import TestSuite, assert_almost_equal
 from std.utils.index import Index
 
@@ -39,13 +44,12 @@ def run_ssd_intra_chunk_gpu[
     ctx: DeviceContext,
     rtol: Float64 = 0.01,
 ) raises:
-    """Run the SSD intra-chunk GPU kernel and check it against a CPU reference.
+    """Run the optimized SSD intra-chunk GPU path and check against a reference.
 
-    One GPU thread per ``(batch, chunk, head)`` slice computes the intra-chunk
-    diagonal block output; this validates the result against the same naive
-    triple-loop reference used by the CPU test.
+    Uses batched ``C @ B^T`` (Modular tensor-core matmul) plus a Triton-style
+    tiled chunk-scan kernel. Validates against the same independent scalar
+    reference used by the CPU test.
     """
-    comptime SLICE_BLOCK_SIZE = 128
     comptime layout_4d = Layout.row_major[4]()
     comptime layout_5d = Layout.row_major[5]()
 
@@ -139,9 +143,7 @@ def run_ssd_intra_chunk_gpu[
         row_major(batch, n_chunks, n_heads, chunk_len, head_dim),
     )
 
-    var total_slices = batch * n_chunks * n_heads
-
-    var compiled_func = ctx.compile_function[
+    with ctx.push_context():
         ssd_intra_chunk_fwd_gpu[
             dtype,
             C_tt.LayoutType,
@@ -149,12 +151,7 @@ def run_ssd_intra_chunk_gpu[
             X_tt.LayoutType,
             A_tt.LayoutType,
             Y_tt.LayoutType,
-        ]
-    ]()
-
-    with ctx.push_context():
-        ctx.enqueue_function(
-            compiled_func,
+        ](
             batch,
             n_chunks,
             n_heads,
@@ -166,8 +163,7 @@ def run_ssd_intra_chunk_gpu[
             X_tt,
             A_tt,
             Y_tt,
-            grid_dim=(ceildiv(total_slices, SLICE_BLOCK_SIZE),),
-            block_dim=(SLICE_BLOCK_SIZE,),
+            ctx,
         )
 
     with ctx.push_context():
@@ -231,6 +227,214 @@ def run_ssd_intra_chunk_gpu[
     # ── Compare GPU vs CPU reference ─────────────────────────────────────────
     for i in range(xy_count):
         assert_almost_equal(Y_gpu_h.ptr[i], ref_heap[i], rtol=rtol)
+
+
+def run_ssd_intra_chunk_gpu_static[
+    dtype: DType,
+    chunk_len: Int,
+    state_dim: Int,
+    head_dim: Int,
+    use_mma: Bool = False,
+](
+    batch: Int,
+    n_chunks: Int,
+    n_heads: Int,
+    ctx: DeviceContext,
+    rtol: Float64 = 0.01,
+) raises:
+    """Exercise a static-shape path against the scalar CPU reference.
+
+    ``use_mma=False`` drives the default scalar-scan static path
+    (``ssd_intra_chunk_fwd_gpu_static``); ``use_mma=True`` drives the
+    tensor-core path that materialises ``M = causal_decay(CB)`` and computes
+    ``Y = M @ X`` via two batched matmuls
+    (``ssd_intra_chunk_fwd_gpu_static_mma``). ``chunk_len`` / ``state_dim`` /
+    ``head_dim`` are comptime so ``batched_matmul`` sees static N/K.
+    """
+    comptime layout_4d = Layout.row_major[4]()
+    comptime layout_5d = Layout.row_major[5]()
+
+    var cb_count = batch * n_chunks * n_heads * chunk_len * state_dim
+    var xy_count = batch * n_chunks * n_heads * chunk_len * head_dim
+    var a_count = batch * n_chunks * n_heads * chunk_len
+
+    var C_heap = ctx.enqueue_create_host_buffer[dtype](cb_count)
+    var C_h = LayoutTensor[dtype, layout_5d, _](
+        C_heap,
+        RuntimeLayout[layout_5d].row_major(
+            Index(batch, n_chunks, n_heads, chunk_len, state_dim)
+        ),
+    )
+    rand[dtype](C_h.ptr, C_h.size())
+
+    var B_heap = ctx.enqueue_create_host_buffer[dtype](cb_count)
+    var B_h = LayoutTensor[dtype, layout_5d, _](
+        B_heap,
+        RuntimeLayout[layout_5d].row_major(
+            Index(batch, n_chunks, n_heads, chunk_len, state_dim)
+        ),
+    )
+    rand[dtype](B_h.ptr, B_h.size())
+
+    var X_heap = ctx.enqueue_create_host_buffer[dtype](xy_count)
+    var X_h = LayoutTensor[dtype, layout_5d, _](
+        X_heap,
+        RuntimeLayout[layout_5d].row_major(
+            Index(batch, n_chunks, n_heads, chunk_len, head_dim)
+        ),
+    )
+    rand[dtype](X_h.ptr, X_h.size())
+
+    var A_heap = ctx.enqueue_create_host_buffer[dtype](a_count)
+    var A_h = LayoutTensor[dtype, layout_4d, _](
+        A_heap,
+        RuntimeLayout[layout_4d].row_major(
+            Index(batch, n_chunks, n_heads, chunk_len)
+        ),
+    )
+    rand[dtype](A_h.ptr, A_h.size())
+    for i in range(a_count):
+        var v = A_h.ptr[i].cast[DType.float32]()
+        var scaled = Float32(-0.6) + Float32(0.5) * v
+        A_h.ptr[i] = Scalar[dtype](scaled)
+
+    var Y_gpu_heap = ctx.enqueue_create_host_buffer[dtype](xy_count)
+
+    var C_device = ctx.enqueue_create_buffer[dtype](cb_count)
+    var B_device = ctx.enqueue_create_buffer[dtype](cb_count)
+    var X_device = ctx.enqueue_create_buffer[dtype](xy_count)
+    var A_device = ctx.enqueue_create_buffer[dtype](a_count)
+    var Y_device = ctx.enqueue_create_buffer[dtype](xy_count)
+
+    with ctx.push_context():
+        ctx.enqueue_copy(C_device, C_h.ptr)
+        ctx.enqueue_copy(B_device, B_h.ptr)
+        ctx.enqueue_copy(X_device, X_h.ptr)
+        ctx.enqueue_copy(A_device, A_h.ptr)
+
+    var C_tt = TileTensor(
+        C_device, row_major(batch, n_chunks, n_heads, chunk_len, state_dim)
+    )
+    var B_tt = TileTensor(
+        B_device, row_major(batch, n_chunks, n_heads, chunk_len, state_dim)
+    )
+    var X_tt = TileTensor(
+        X_device, row_major(batch, n_chunks, n_heads, chunk_len, head_dim)
+    )
+    var A_tt = TileTensor(
+        A_device, row_major(batch, n_chunks, n_heads, chunk_len)
+    )
+    var Y_tt = TileTensor(
+        Y_device, row_major(batch, n_chunks, n_heads, chunk_len, head_dim)
+    )
+
+    with ctx.push_context():
+        comptime if use_mma:
+            ssd_intra_chunk_fwd_gpu_static_mma[
+                dtype,
+                chunk_len,
+                state_dim,
+                head_dim,
+                C_tt.LayoutType,
+                B_tt.LayoutType,
+                X_tt.LayoutType,
+                A_tt.LayoutType,
+                Y_tt.LayoutType,
+            ](batch, n_chunks, n_heads, C_tt, B_tt, X_tt, A_tt, Y_tt, ctx)
+        else:
+            ssd_intra_chunk_fwd_gpu_static[
+                dtype,
+                chunk_len,
+                state_dim,
+                head_dim,
+                C_tt.LayoutType,
+                B_tt.LayoutType,
+                X_tt.LayoutType,
+                A_tt.LayoutType,
+                Y_tt.LayoutType,
+            ](batch, n_chunks, n_heads, C_tt, B_tt, X_tt, A_tt, Y_tt, ctx)
+
+    with ctx.push_context():
+        ctx.enqueue_copy(Y_gpu_heap, Y_device)
+    ctx.synchronize()
+
+    var ref_heap = ctx.enqueue_create_host_buffer[dtype](xy_count)
+
+    var cb_h_stride = chunk_len * state_dim
+    var cb_c_stride = n_heads * cb_h_stride
+    var cb_b_stride = n_chunks * cb_c_stride
+    var xy_h_stride = chunk_len * head_dim
+    var xy_c_stride = n_heads * xy_h_stride
+    var xy_b_stride = n_chunks * xy_c_stride
+    var a_h_stride = chunk_len
+    var a_c_stride = n_heads * a_h_stride
+    var a_b_stride = n_chunks * a_c_stride
+
+    for b in range(batch):
+        for c in range(n_chunks):
+            for h in range(n_heads):
+                var cb_base = (
+                    b * cb_b_stride + c * cb_c_stride + h * cb_h_stride
+                )
+                var xy_base = (
+                    b * xy_b_stride + c * xy_c_stride + h * xy_h_stride
+                )
+                var a_base = b * a_b_stride + c * a_c_stride + h * a_h_stride
+
+                var cumsum = List[Float32](length=chunk_len, fill=0.0)
+                var acc = Float32(0.0)
+                for l in range(chunk_len):
+                    acc += A_h.ptr[a_base + l].cast[DType.float32]()
+                    cumsum[l] = acc
+
+                for l in range(chunk_len):
+                    for p in range(head_dim):
+                        var y_acc = Float32(0.0)
+                        for s in range(l + 1):
+                            var dot = Float32(0.0)
+                            for n in range(state_dim):
+                                var cv = C_h.ptr[
+                                    cb_base + l * state_dim + n
+                                ].cast[DType.float32]()
+                                var bv = B_h.ptr[
+                                    cb_base + s * state_dim + n
+                                ].cast[DType.float32]()
+                                dot += cv * bv
+                            var decay = exp(cumsum[l] - cumsum[s])
+                            var xv = X_h.ptr[xy_base + s * head_dim + p].cast[
+                                DType.float32
+                            ]()
+                            y_acc += dot * decay * xv
+                        ref_heap[xy_base + l * head_dim + p] = Scalar[dtype](
+                            y_acc
+                        )
+
+    for i in range(xy_count):
+        assert_almost_equal(Y_gpu_heap[i], ref_heap[i], rtol=rtol)
+
+
+def test_ssd_intra_chunk_gpu_static_scalar() raises:
+    """Static-shape scalar-scan path against the naive reference."""
+    var ctx = DeviceContext()
+    run_ssd_intra_chunk_gpu_static[
+        DType.float32, chunk_len=16, state_dim=16, head_dim=8
+    ](batch=1, n_chunks=3, n_heads=2, ctx=ctx)
+
+
+def test_ssd_intra_chunk_gpu_static_mma() raises:
+    """Static-shape tensor-core MMA path against the naive reference."""
+    var ctx = DeviceContext()
+    run_ssd_intra_chunk_gpu_static[
+        DType.float32, chunk_len=16, state_dim=16, head_dim=8, use_mma=True
+    ](batch=1, n_chunks=3, n_heads=2, ctx=ctx)
+
+
+def test_ssd_intra_chunk_gpu_static_mma_multi_batch() raises:
+    """Static-shape MMA path with multiple batch elements."""
+    var ctx = DeviceContext()
+    run_ssd_intra_chunk_gpu_static[
+        DType.float32, chunk_len=8, state_dim=8, head_dim=4, use_mma=True
+    ](batch=2, n_chunks=2, n_heads=2, ctx=ctx)
 
 
 def test_ssd_intra_chunk_gpu_golden() raises:
@@ -355,7 +559,7 @@ def test_ssd_intra_chunk_gpu_golden() raises:
     var total_slices = batch * n_chunks * n_heads
 
     var compiled_func = ctx.compile_function[
-        ssd_intra_chunk_fwd_gpu[
+        ssd_intra_chunk_fwd_gpu_naive[
             dtype,
             C_tt.LayoutType,
             B_tt.LayoutType,
