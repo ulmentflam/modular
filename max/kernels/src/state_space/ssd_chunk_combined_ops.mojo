@@ -44,14 +44,44 @@ import extensibility as compiler
 from extensibility import InputTensor, OutputTensor
 from std.gpu.host import DeviceContext
 from std.gpu.host.info import is_cpu, is_gpu
+from std.gpu import (
+    block_dim_uint as block_dim,
+    block_idx_uint as block_idx,
+    thread_idx_uint as thread_idx,
+)
+from std.math import ceildiv
 from std.utils.index import Index, IndexList
 
-from layout import Layout, LayoutTensor, RuntimeLayout
+from layout import (
+    Layout,
+    LayoutTensor,
+    RuntimeLayout,
+    TensorLayout,
+    TileTensor,
+    row_major,
+)
 
-from state_space.ssd_chunk import ssd_intra_chunk_fwd_cpu
-from state_space.ssd_chunk_state import ssd_chunk_state_fwd_cpu
-from state_space.ssd_chunk_scan import ssd_chunk_scan_fwd_cpu
-from state_space.ssd_chunk_combine import ssd_output_recombination_fwd_cpu
+from state_space.ssd_chunk import (
+    ssd_intra_chunk_fwd_cpu,
+    ssd_intra_chunk_fwd_gpu,
+)
+from state_space.ssd_chunk_state import (
+    ssd_chunk_state_fwd_cpu,
+    ssd_chunk_state_fwd_gpu,
+    ssd_chunk_state_fwd_gpu_fused,
+)
+from state_space.ssd_chunk_scan import (
+    ssd_chunk_scan_fwd_cpu,
+    ssd_chunk_scan_fwd_gpu,
+)
+from state_space.ssd_chunk_combine import (
+    ssd_output_recombination_fwd_cpu,
+    ssd_output_recombination_fwd_gpu,
+)
+
+# Block size for the elementwise precompute/postprocess and the scan/combine
+# device-kernel launches (matches the per-stage GPU tests).
+comptime _SSD_GPU_BLOCK = 256
 
 
 # ===----------------------------------------------------------------------=== #
@@ -431,6 +461,416 @@ def _ssd_chunk_scan_combined_cpu[
 
 
 # ===----------------------------------------------------------------------=== #
+# GPU dispatch — fully on-device stitched pipeline
+# ===----------------------------------------------------------------------=== #
+
+
+def _ssd_combined_precompute_gpu[
+    dtype: DType,
+    x_LT: TensorLayout,
+    dt_LT: TensorLayout,
+    A_LT: TensorLayout,
+    bc_LT: TensorLayout,
+    xd_LT: TensorLayout,
+    ad_LT: TensorLayout,
+    bcc_LT: TensorLayout,
+](
+    batch: Int,
+    seqlen: Int,
+    n_heads: Int,
+    head_dim: Int,
+    state_dim: Int,
+    n_chunks: Int,
+    chunk_size: Int,
+    x: TileTensor[dtype, x_LT, MutAnyOrigin],
+    dt: TileTensor[dtype, dt_LT, MutAnyOrigin],
+    A: TileTensor[dtype, A_LT, MutAnyOrigin],
+    B: TileTensor[dtype, bc_LT, MutAnyOrigin],
+    C: TileTensor[dtype, bc_LT, MutAnyOrigin],
+    X_disc: TileTensor[dtype, xd_LT, MutAnyOrigin],
+    A_disc: TileTensor[dtype, ad_LT, MutAnyOrigin],
+    B_chunk: TileTensor[dtype, bcc_LT, MutAnyOrigin],
+    C_chunk: TileTensor[dtype, bcc_LT, MutAnyOrigin],
+):
+    """Stage 0 (GPU): discretize + chunked reshape. One thread per (b,c,h,l).
+
+    Mirrors ``_ssd_combined_precompute_cpu``: ``X_disc = x*dt`` (chunked),
+    ``A_disc = A[h]*dt`` (chunked), ``B_chunk``/``C_chunk`` pure reshape. The
+    flat ``(b,c,h,l)`` index is row-major over ``A_disc`` so ``A_disc.ptr[idx]``
+    is the destination directly.
+    """
+    var idx = Int(block_dim.x) * Int(block_idx.x) + Int(thread_idx.x)
+    var total = batch * n_chunks * n_heads * chunk_size
+    if idx >= total:
+        return
+
+    var l = idx % chunk_size
+    var h = (idx // chunk_size) % n_heads
+    var c = (idx // (chunk_size * n_heads)) % n_chunks
+    var bi = idx // (chunk_size * n_heads * n_chunks)
+    var t = c * chunk_size + l
+
+    var a_h = A.ptr[h].cast[DType.float32]()
+    var dt_off = (bi * seqlen + t) * n_heads + h
+    var dt_val = dt.ptr[dt_off].cast[DType.float32]()
+    A_disc.ptr[idx] = (a_h * dt_val).cast[dtype]()
+
+    var x_in_base = ((bi * seqlen + t) * n_heads + h) * head_dim
+    var x_out_base = idx * head_dim
+    for p in range(head_dim):
+        X_disc.ptr[x_out_base + p] = (
+            x.ptr[x_in_base + p].cast[DType.float32]() * dt_val
+        ).cast[dtype]()
+
+    var bc_in_base = ((bi * seqlen + t) * n_heads + h) * state_dim
+    var bc_out_base = idx * state_dim
+    for n in range(state_dim):
+        B_chunk.ptr[bc_out_base + n] = B.ptr[bc_in_base + n]
+        C_chunk.ptr[bc_out_base + n] = C.ptr[bc_in_base + n]
+
+
+def _ssd_combined_chunk_decays_gpu[
+    dtype: DType,
+    ad_LT: TensorLayout,
+    cd_LT: TensorLayout,
+](
+    batch: Int,
+    n_chunks: Int,
+    n_heads: Int,
+    chunk_size: Int,
+    A_disc: TileTensor[dtype, ad_LT, MutAnyOrigin],
+    chunk_decays: TileTensor[dtype, cd_LT, MutAnyOrigin],
+):
+    """Stage 0b (GPU): ``chunk_decays[b,c,h] = sum_l A_disc[b,c,h,l]``."""
+    var idx = Int(block_dim.x) * Int(block_idx.x) + Int(thread_idx.x)
+    var total = batch * n_chunks * n_heads
+    if idx >= total:
+        return
+    var base = idx * chunk_size
+    var s = Float32(0.0)
+    for l in range(chunk_size):
+        s += A_disc.ptr[base + l].cast[DType.float32]()
+    chunk_decays.ptr[idx] = s.cast[dtype]()
+
+
+def _ssd_combined_postprocess_gpu[
+    dtype: DType,
+    yc_LT: TensorLayout,
+    y_LT: TensorLayout,
+](
+    batch: Int,
+    seqlen: Int,
+    n_heads: Int,
+    head_dim: Int,
+    n_chunks: Int,
+    chunk_size: Int,
+    Y_chunked: TileTensor[dtype, yc_LT, MutAnyOrigin],
+    Y: TileTensor[dtype, y_LT, MutAnyOrigin],
+):
+    """Stage 5 (GPU): flatten ``Y_chunked[b,c,h,l,p]`` -> ``Y[b,t,h,p]``."""
+    var idx = Int(block_dim.x) * Int(block_idx.x) + Int(thread_idx.x)
+    var total = batch * n_chunks * n_heads * chunk_size * head_dim
+    if idx >= total:
+        return
+    var p = idx % head_dim
+    var l = (idx // head_dim) % chunk_size
+    var h = (idx // (head_dim * chunk_size)) % n_heads
+    var c = (idx // (head_dim * chunk_size * n_heads)) % n_chunks
+    var bi = idx // (head_dim * chunk_size * n_heads * n_chunks)
+    var t = c * chunk_size + l
+    var y_out = ((bi * seqlen + t) * n_heads + h) * head_dim + p
+    Y.ptr[y_out] = Y_chunked.ptr[idx]
+
+
+def _ssd_chunk_scan_combined_gpu[
+    dtype: DType,
+    chunk_size: Int,
+](
+    batch: Int,
+    seqlen: Int,
+    n_heads: Int,
+    head_dim: Int,
+    state_dim: Int,
+    x_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dt_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    A_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    B_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    C_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    Y_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    final_state_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    ctx: DeviceContext,
+) raises:
+    """Fully on-device SSD chunk-scan-combined.
+
+    Runs all six stages on the GPU over device-resident buffers (no host
+    round-trip): precompute -> intra-chunk diagonal -> chunk end-state (the
+    optimized ``ssd_chunk_state`` kernel; the fused tensor-core path for the
+    gate dims, else the parallel scalar path) -> inter-chunk scan -> output
+    recombination -> postprocess. ``*_ptr`` are device pointers.
+    """
+    if seqlen % chunk_size != 0:
+        raise Error(
+            "ssd_chunk_scan_combined: seqlen must be divisible by chunk_size"
+        )
+    var n_chunks = seqlen // chunk_size
+    var num_slices = batch * n_chunks * n_heads
+
+    # Device intermediates (same shapes as the CPU dispatch).
+    var xd_n = batch * n_chunks * n_heads * chunk_size * head_dim
+    var ad_n = batch * n_chunks * n_heads * chunk_size
+    var bc_n = batch * n_chunks * n_heads * chunk_size * state_dim
+    var st_n = batch * n_chunks * n_heads * head_dim * state_dim
+    var cd_n = batch * n_chunks * n_heads
+    var fin_n = batch * n_heads * head_dim * state_dim
+
+    var X_disc_d = ctx.enqueue_create_buffer[dtype](xd_n)
+    var A_disc_d = ctx.enqueue_create_buffer[dtype](ad_n)
+    var B_chunk_d = ctx.enqueue_create_buffer[dtype](bc_n)
+    var C_chunk_d = ctx.enqueue_create_buffer[dtype](bc_n)
+    var Y_diag_d = ctx.enqueue_create_buffer[dtype](xd_n)
+    var chunk_states_d = ctx.enqueue_create_buffer[dtype](st_n)
+    var entering_d = ctx.enqueue_create_buffer[dtype](st_n)
+    var final_d = ctx.enqueue_create_buffer[dtype](fin_n)
+    var chunk_decays_d = ctx.enqueue_create_buffer[dtype](cd_n)
+    var Y_chunked_d = ctx.enqueue_create_buffer[dtype](xd_n)
+
+    # TileTensor views over inputs (device ptrs) and intermediates.
+    var x_tt = TileTensor(x_ptr, row_major(batch, seqlen, n_heads, head_dim))
+    var dt_tt = TileTensor(dt_ptr, row_major(batch, seqlen, n_heads))
+    var A_tt = TileTensor(A_ptr, row_major(n_heads))
+    var B_tt = TileTensor(B_ptr, row_major(batch, seqlen, n_heads, state_dim))
+    var C_tt = TileTensor(C_ptr, row_major(batch, seqlen, n_heads, state_dim))
+
+    var X_disc = TileTensor(
+        X_disc_d, row_major(batch, n_chunks, n_heads, chunk_size, head_dim)
+    )
+    var A_disc = TileTensor(
+        A_disc_d, row_major(batch, n_chunks, n_heads, chunk_size)
+    )
+    var B_chunk = TileTensor(
+        B_chunk_d, row_major(batch, n_chunks, n_heads, chunk_size, state_dim)
+    )
+    var C_chunk = TileTensor(
+        C_chunk_d, row_major(batch, n_chunks, n_heads, chunk_size, state_dim)
+    )
+    var Y_diag = TileTensor(
+        Y_diag_d, row_major(batch, n_chunks, n_heads, chunk_size, head_dim)
+    )
+    var chunk_states = TileTensor(
+        chunk_states_d, row_major(batch, n_chunks, n_heads, head_dim, state_dim)
+    )
+    var entering = TileTensor(
+        entering_d, row_major(batch, n_chunks, n_heads, head_dim, state_dim)
+    )
+    var final = TileTensor(
+        final_d, row_major(batch, n_heads, head_dim, state_dim)
+    )
+    var chunk_decays = TileTensor(
+        chunk_decays_d, row_major(batch, n_chunks, n_heads)
+    )
+    var Y_chunked = TileTensor(
+        Y_chunked_d, row_major(batch, n_chunks, n_heads, chunk_size, head_dim)
+    )
+    var Y_out = TileTensor(Y_ptr, row_major(batch, seqlen, n_heads, head_dim))
+
+    # Stage 0: precompute (discretize + chunked reshape) + chunk decays.
+    var pre_total = batch * n_chunks * n_heads * chunk_size
+    var pre_compiled = ctx.compile_function[
+        _ssd_combined_precompute_gpu[
+            dtype,
+            x_tt.LayoutType,
+            dt_tt.LayoutType,
+            A_tt.LayoutType,
+            B_tt.LayoutType,
+            X_disc.LayoutType,
+            A_disc.LayoutType,
+            B_chunk.LayoutType,
+        ]
+    ]()
+    var cd_compiled = ctx.compile_function[
+        _ssd_combined_chunk_decays_gpu[
+            dtype, A_disc.LayoutType, chunk_decays.LayoutType
+        ]
+    ]()
+    with ctx.push_context():
+        ctx.enqueue_function(
+            pre_compiled,
+            batch,
+            seqlen,
+            n_heads,
+            head_dim,
+            state_dim,
+            n_chunks,
+            chunk_size,
+            x_tt,
+            dt_tt,
+            A_tt,
+            B_tt,
+            C_tt,
+            X_disc,
+            A_disc,
+            B_chunk,
+            C_chunk,
+            grid_dim=(ceildiv(pre_total, _SSD_GPU_BLOCK),),
+            block_dim=(_SSD_GPU_BLOCK,),
+        )
+        ctx.enqueue_function(
+            cd_compiled,
+            batch,
+            n_chunks,
+            n_heads,
+            chunk_size,
+            A_disc,
+            chunk_decays,
+            grid_dim=(ceildiv(cd_n, _SSD_GPU_BLOCK),),
+            block_dim=(_SSD_GPU_BLOCK,),
+        )
+
+    # Stage 1: intra-chunk diagonal -> Y_diag (host launcher).
+    ssd_intra_chunk_fwd_gpu[
+        dtype,
+        C_chunk.LayoutType,
+        B_chunk.LayoutType,
+        X_disc.LayoutType,
+        A_disc.LayoutType,
+        Y_diag.LayoutType,
+    ](
+        batch,
+        n_chunks,
+        n_heads,
+        chunk_size,
+        state_dim,
+        head_dim,
+        C_chunk,
+        B_chunk,
+        X_disc,
+        A_disc,
+        Y_diag,
+        ctx,
+    )
+
+    # Stage 2: per-chunk end-states (optimized chunk_state).
+    # Fused tensor-core path for the gate dims; parallel scalar path otherwise.
+    if state_dim == 128 and head_dim == 64:
+        ssd_chunk_state_fwd_gpu_fused[
+            dtype,
+            chunk_size,
+            128,
+            64,
+            B_chunk.LayoutType,
+            X_disc.LayoutType,
+            A_disc.LayoutType,
+            chunk_states.LayoutType,
+        ](batch, n_chunks, n_heads, B_chunk, X_disc, A_disc, chunk_states, ctx)
+    else:
+        var cs_compiled = ctx.compile_function[
+            ssd_chunk_state_fwd_gpu[
+                dtype,
+                B_chunk.LayoutType,
+                X_disc.LayoutType,
+                A_disc.LayoutType,
+                chunk_states.LayoutType,
+            ]
+        ]()
+        with ctx.push_context():
+            ctx.enqueue_function(
+                cs_compiled,
+                batch,
+                n_chunks,
+                n_heads,
+                chunk_size,
+                state_dim,
+                head_dim,
+                B_chunk,
+                X_disc,
+                A_disc,
+                chunk_states,
+                grid_dim=(num_slices, 1),
+                block_dim=(chunk_size,),
+            )
+
+    # Stage 3: inter-chunk recurrence (device kernel).
+    var scan_total = batch * n_heads * head_dim * state_dim
+    var scan_compiled = ctx.compile_function[
+        ssd_chunk_scan_fwd_gpu[
+            dtype,
+            chunk_states.LayoutType,
+            chunk_decays.LayoutType,
+            entering.LayoutType,
+            final.LayoutType,
+        ]
+    ]()
+    with ctx.push_context():
+        ctx.enqueue_function(
+            scan_compiled,
+            batch,
+            n_chunks,
+            n_heads,
+            head_dim,
+            state_dim,
+            chunk_states,
+            chunk_decays,
+            entering,
+            final,
+            grid_dim=(ceildiv(scan_total, _SSD_GPU_BLOCK),),
+            block_dim=(_SSD_GPU_BLOCK,),
+        )
+
+    # Stage 4: output recombination (device kernel).
+    var comb_total = batch * n_chunks * n_heads * chunk_size * head_dim
+    var comb_compiled = ctx.compile_function[
+        ssd_output_recombination_fwd_gpu[
+            dtype,
+            C_chunk.LayoutType,
+            entering.LayoutType,
+            A_disc.LayoutType,
+            Y_diag.LayoutType,
+            Y_chunked.LayoutType,
+        ]
+    ]()
+    with ctx.push_context():
+        ctx.enqueue_function(
+            comb_compiled,
+            batch,
+            n_chunks,
+            n_heads,
+            chunk_size,
+            head_dim,
+            state_dim,
+            C_chunk,
+            entering,
+            A_disc,
+            Y_diag,
+            Y_chunked,
+            grid_dim=(ceildiv(comb_total, _SSD_GPU_BLOCK),),
+            block_dim=(_SSD_GPU_BLOCK,),
+        )
+
+    # Stage 5: postprocess (un-chunk) + copy final state to the output buffer.
+    var post_compiled = ctx.compile_function[
+        _ssd_combined_postprocess_gpu[
+            dtype, Y_chunked.LayoutType, Y_out.LayoutType
+        ]
+    ]()
+    with ctx.push_context():
+        ctx.enqueue_function(
+            post_compiled,
+            batch,
+            seqlen,
+            n_heads,
+            head_dim,
+            n_chunks,
+            chunk_size,
+            Y_chunked,
+            Y_out,
+            grid_dim=(ceildiv(comb_total, _SSD_GPU_BLOCK),),
+            block_dim=(_SSD_GPU_BLOCK,),
+        )
+        ctx.enqueue_copy(final_state_ptr, final_d.unsafe_ptr(), fin_n)
+    ctx.synchronize()
+
+
+# ===----------------------------------------------------------------------=== #
 # @compiler.register entry point
 # ===----------------------------------------------------------------------=== #
 
@@ -507,82 +947,25 @@ struct SSDChunkScanCombined[chunk_size: Int = 256]:
                 final_state.unsafe_ptr(),
             )
         elif is_gpu[target]():
-            # GPU path: stage through pinned host memory. Copy device inputs
-            # to the host, run the CPU dispatch (which already passes parity
-            # vs the torch reference), then copy outputs back to device. The
-            # four device-resident GPU stage kernels are tested individually
-            # in `test/gpu/state_space/`; a fully on-device stitched dispatch
-            # is tracked as a separate follow-up. This staging path keeps
-            # end-to-end correctness while we close the perf gap.
-            var x_count = batch * seqlen * n_heads * head_dim
-            var dt_count = batch * seqlen * n_heads
-            var A_count = n_heads
-            var bc_count = batch * seqlen * n_heads * state_dim
-            var y_count = x_count
-            var final_count = batch * n_heads * head_dim * state_dim
-
-            comptime layout_1d = Layout.row_major[1]()
-
-            var x_buf = ctx.enqueue_create_host_buffer[dtype](x_count)
-            var x_lt = LayoutTensor[dtype, layout_1d, _](
-                x_buf, RuntimeLayout[layout_1d].row_major(Index(x_count))
-            )
-            var dt_buf = ctx.enqueue_create_host_buffer[dtype](dt_count)
-            var dt_lt = LayoutTensor[dtype, layout_1d, _](
-                dt_buf, RuntimeLayout[layout_1d].row_major(Index(dt_count))
-            )
-            var A_buf = ctx.enqueue_create_host_buffer[dtype](A_count)
-            var A_lt = LayoutTensor[dtype, layout_1d, _](
-                A_buf, RuntimeLayout[layout_1d].row_major(Index(A_count))
-            )
-            var B_buf = ctx.enqueue_create_host_buffer[dtype](bc_count)
-            var B_lt = LayoutTensor[dtype, layout_1d, _](
-                B_buf, RuntimeLayout[layout_1d].row_major(Index(bc_count))
-            )
-            var C_buf = ctx.enqueue_create_host_buffer[dtype](bc_count)
-            var C_lt = LayoutTensor[dtype, layout_1d, _](
-                C_buf, RuntimeLayout[layout_1d].row_major(Index(bc_count))
-            )
-            var Y_buf = ctx.enqueue_create_host_buffer[dtype](y_count)
-            var Y_lt = LayoutTensor[dtype, layout_1d, _](
-                Y_buf, RuntimeLayout[layout_1d].row_major(Index(y_count))
-            )
-            var final_buf = ctx.enqueue_create_host_buffer[dtype](final_count)
-            var final_lt = LayoutTensor[dtype, layout_1d, _](
-                final_buf,
-                RuntimeLayout[layout_1d].row_major(Index(final_count)),
-            )
-
-            with ctx.push_context():
-                ctx.enqueue_copy(x_lt.ptr, x.unsafe_ptr(), x_count)
-                ctx.enqueue_copy(dt_lt.ptr, dt.unsafe_ptr(), dt_count)
-                ctx.enqueue_copy(A_lt.ptr, A.unsafe_ptr(), A_count)
-                ctx.enqueue_copy(B_lt.ptr, B.unsafe_ptr(), bc_count)
-                ctx.enqueue_copy(C_lt.ptr, C.unsafe_ptr(), bc_count)
-            ctx.synchronize()
-
-            _ssd_chunk_scan_combined_cpu[dtype](
+            # Fully on-device stitched dispatch: all six stages run on the GPU
+            # over device-resident intermediates (no host round-trip). Stage 2
+            # uses the optimized ssd_chunk_state kernel (fused tensor-core path
+            # for the gate dims, parallel scalar otherwise).
+            _ssd_chunk_scan_combined_gpu[dtype, Self.chunk_size](
                 batch,
                 seqlen,
                 n_heads,
                 head_dim,
                 state_dim,
-                Self.chunk_size,
-                x_lt.ptr,
-                dt_lt.ptr,
-                A_lt.ptr,
-                B_lt.ptr,
-                C_lt.ptr,
-                Y_lt.ptr,
-                final_lt.ptr,
+                x.unsafe_ptr(),
+                dt.unsafe_ptr(),
+                A.unsafe_ptr(),
+                B.unsafe_ptr(),
+                C.unsafe_ptr(),
+                Y.unsafe_ptr(),
+                final_state.unsafe_ptr(),
+                ctx,
             )
-
-            with ctx.push_context():
-                ctx.enqueue_copy(Y.unsafe_ptr(), Y_lt.ptr, y_count)
-                ctx.enqueue_copy(
-                    final_state.unsafe_ptr(), final_lt.ptr, final_count
-                )
-            ctx.synchronize()
         else:
             raise Error("ssd_chunk_scan_combined: unsupported target")
 
