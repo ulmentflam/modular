@@ -241,6 +241,8 @@ def run_ssd_intra_chunk_gpu_static[
     n_heads: Int,
     ctx: DeviceContext,
     rtol: Float64 = 0.01,
+    a_min: Float32 = -0.6,
+    a_max: Float32 = -0.1,
 ) raises:
     """Exercise a static-shape path against the scalar CPU reference.
 
@@ -250,6 +252,12 @@ def run_ssd_intra_chunk_gpu_static[
     ``Y = M @ X`` via two batched matmuls
     (``ssd_intra_chunk_fwd_gpu_static_mma``). ``chunk_len`` / ``state_dim`` /
     ``head_dim`` are comptime so ``batched_matmul`` sees static N/K.
+
+    ``a_min`` / ``a_max`` bound the per-token decay ``A``. The scan factors
+    ``exp(cum_l−cum_s) = exp(cum_l)·exp(−cum_s)``; the intermediate
+    ``exp(−cum_s)`` can overflow FP32 once ``|cum|`` exceeds ~88, so long
+    ``chunk_len`` tests use a milder range to stay in the regime real Mamba2
+    decay rates occupy.
     """
     comptime layout_4d = Layout.row_major[4]()
     comptime layout_5d = Layout.row_major[5]()
@@ -295,7 +303,7 @@ def run_ssd_intra_chunk_gpu_static[
     rand[dtype](A_h.ptr, A_h.size())
     for i in range(a_count):
         var v = A_h.ptr[i].cast[DType.float32]()
-        var scaled = Float32(-0.6) + Float32(0.5) * v
+        var scaled = a_min + (a_max - a_min) * v
         A_h.ptr[i] = Scalar[dtype](scaled)
 
     var Y_gpu_heap = ctx.enqueue_create_host_buffer[dtype](xy_count)
@@ -435,6 +443,71 @@ def test_ssd_intra_chunk_gpu_static_mma_multi_batch() raises:
     run_ssd_intra_chunk_gpu_static[
         DType.float32, chunk_len=8, state_dim=8, head_dim=4, use_mma=True
     ](batch=2, n_chunks=2, n_heads=2, ctx=ctx)
+
+
+def test_ssd_intra_chunk_gpu_static_a100_mma_shape() raises:
+    """Production-shape static scalar path exercising the changed GPU paths.
+
+    Covers the code paths the GPU optimizations actually changed, which the
+    tiny shapes above do NOT:
+
+    - ``state_dim=128`` + ``chunk_len=128`` (multiple of 128) makes the
+      ``CB = C @ B^T`` stage take ``batched_matmul``'s **A100 batched
+      tensor-core path** (``multistage_gemm_cond``: N%128==0, K%32==0, K>=128).
+    - ``chunk_len=128`` > ``SCAN_BLOCK_M`` (32 on GB10) → **4 M-tiles**, so the
+      causal early-exit / tail-balancing across M-tiles is exercised.
+    - ``head_dim=64`` > ``SCAN_BLOCK_N`` (32) → **2 N-tiles**.
+    - The parallel cumsum runs one block per slice with ``block_dim=128``.
+    """
+    var ctx = DeviceContext()
+    run_ssd_intra_chunk_gpu_static[
+        DType.float32, chunk_len=128, state_dim=128, head_dim=64
+    ](batch=1, n_chunks=1, n_heads=2, ctx=ctx)
+
+
+def test_ssd_intra_chunk_gpu_static_mma_a100_shape() raises:
+    """Production-shape MMA path: decay kernel + ``Y = M @ X`` at the shape
+    where the ``CB`` matmul takes the A100 batched tensor-core path
+    (``state_dim=128``, ``chunk_len=128``)."""
+    var ctx = DeviceContext()
+    run_ssd_intra_chunk_gpu_static[
+        DType.float32,
+        chunk_len=128,
+        state_dim=128,
+        head_dim=64,
+        use_mma=True,
+    ](batch=1, n_chunks=1, n_heads=2, ctx=ctx)
+
+
+def test_ssd_intra_chunk_gpu_static_long_chunk() raises:
+    """Full Mamba2 ``chunk_len=256`` with realistic (mild) decay.
+
+    Covers the production chunk length: the Hillis-Steele cumsum at
+    ``block_dim=256``, 8 scan M-tiles, and the A100 batched MMA. Uses a milder
+    decay range so the factored ``exp(-cum_s)`` stays well within FP32 — the
+    regime real Mamba2 dt*A rates occupy (aggressive decay over 256 tokens can
+    push ``|cum|`` past the ~88 FP32-exp overflow point; see helper docstring).
+    """
+    var ctx = DeviceContext()
+    run_ssd_intra_chunk_gpu_static[
+        DType.float32, chunk_len=256, state_dim=128, head_dim=16
+    ](batch=1, n_chunks=1, n_heads=2, ctx=ctx, a_min=-0.08, a_max=-0.01)
+
+
+def test_ssd_intra_chunk_gpu_multi_m_tile() raises:
+    """Dynamic-shape path with ``chunk_len=64`` > ``SCAN_BLOCK_M`` so the scan
+    spans multiple M-tiles (the tiny dynamic tests above are all single-tile).
+    """
+    var ctx = DeviceContext()
+    run_ssd_intra_chunk_gpu[DType.float32](
+        batch=1,
+        n_chunks=2,
+        n_heads=2,
+        chunk_len=64,
+        state_dim=32,
+        head_dim=16,
+        ctx=ctx,
+    )
 
 
 def test_ssd_intra_chunk_gpu_golden() raises:
