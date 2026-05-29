@@ -34,6 +34,33 @@ modular_py_test(
     ],
 )
 
+# MAX-vs-ssd_minimal parity for the on-device SSD op (numpy oracle validated
+# against the torch reference; see the module docstring).
+modular_py_test(
+    name = "test_mamba2_ssd_parity",
+    size = "medium",
+    srcs = ["test_mamba2_ssd_parity.py"],
+    exec_properties = {
+        "test.resources:gpu-memory": "2",
+    },
+    gpu_constraints = ["//:has_gpu"] + select({
+        "//:apple_gpu": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    mojo_deps = [
+        "//max:state_space",
+    ],
+    tags = ["gpu"],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/pipelines/architectures",
+        requirement("numpy"),
+    ],
+)
+
 # GPU smoke for the SSD op (host-staged dispatch). Skipped on CPU-only hosts.
 modular_py_test(
     name = "test_mamba2_ssd_gpu_smoke",
