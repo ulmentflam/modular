@@ -22,7 +22,11 @@ from layout import (
     row_major,
 )
 from std.random import rand
-from state_space.ssd_chunk_combine import ssd_output_recombination_fwd_gpu
+from state_space.ssd_chunk_combine import (
+    ssd_output_recombination_fwd_gpu,
+    ssd_output_recombination_fwd_gpu_fused,
+    ssd_output_recombination_fwd_gpu_static,
+)
 from std.testing import TestSuite, assert_almost_equal
 from std.utils.index import Index
 
@@ -412,6 +416,224 @@ def test_ssd_output_recombination_gpu_multi_batch() raises:
         state_dim=8,
         ctx=ctx,
     )
+
+
+def run_ssd_output_recombination_gpu_static[
+    dtype: DType,
+    chunk_len: Int,
+    head_dim: Int,
+    state_dim: Int,
+    use_fused: Bool = False,
+](
+    batch: Int,
+    n_chunks: Int,
+    n_heads: Int,
+    ctx: DeviceContext,
+    rtol: Float64 = 0.01,
+) raises:
+    """Validate the static / fused tensor-core path vs the naive CPU reference.
+
+    Uses gate-hitting compile-time dims (``chunk_len % 128 == 0``,
+    ``state_dim % 32 == 0`` and ``>= 128``) so ``batched_matmul`` takes the A100
+    multistage path. With ``use_fused=True``, exercises the single-pass fused
+    MMA path instead.
+    """
+    comptime layout_4d = Layout.row_major[4]()
+    comptime layout_5d = Layout.row_major[5]()
+
+    var c_count = batch * n_chunks * n_heads * chunk_len * state_dim
+    var ent_count = batch * n_chunks * n_heads * head_dim * state_dim
+    var a_count = batch * n_chunks * n_heads * chunk_len
+    var y_count = batch * n_chunks * n_heads * chunk_len * head_dim
+
+    var c_heap = ctx.enqueue_create_host_buffer[dtype](c_count)
+    var c_h = LayoutTensor[dtype, layout_5d, _](
+        c_heap,
+        RuntimeLayout[layout_5d].row_major(
+            Index(batch, n_chunks, n_heads, chunk_len, state_dim)
+        ),
+    )
+    rand[dtype](c_h.ptr, c_h.size())
+
+    var ent_heap = ctx.enqueue_create_host_buffer[dtype](ent_count)
+    var ent_h = LayoutTensor[dtype, layout_5d, _](
+        ent_heap,
+        RuntimeLayout[layout_5d].row_major(
+            Index(batch, n_chunks, n_heads, head_dim, state_dim)
+        ),
+    )
+    rand[dtype](ent_h.ptr, ent_h.size())
+
+    var a_heap = ctx.enqueue_create_host_buffer[dtype](a_count)
+    var a_h = LayoutTensor[dtype, layout_4d, _](
+        a_heap,
+        RuntimeLayout[layout_4d].row_major(
+            Index(batch, n_chunks, n_heads, chunk_len)
+        ),
+    )
+    rand[dtype](a_h.ptr, a_h.size())
+    for i in range(a_count):
+        var v = a_h.ptr[i].cast[DType.float32]()
+        a_h.ptr[i] = Scalar[dtype](Float32(-0.6) + Float32(0.5) * v)
+
+    var yd_heap = ctx.enqueue_create_host_buffer[dtype](y_count)
+    var yd_h = LayoutTensor[dtype, layout_5d, _](
+        yd_heap,
+        RuntimeLayout[layout_5d].row_major(
+            Index(batch, n_chunks, n_heads, chunk_len, head_dim)
+        ),
+    )
+    rand[dtype](yd_h.ptr, yd_h.size())
+
+    var y_gpu_heap = ctx.enqueue_create_host_buffer[dtype](y_count)
+
+    var c_device = ctx.enqueue_create_buffer[dtype](c_count)
+    var ent_device = ctx.enqueue_create_buffer[dtype](ent_count)
+    var a_device = ctx.enqueue_create_buffer[dtype](a_count)
+    var yd_device = ctx.enqueue_create_buffer[dtype](y_count)
+    var y_device = ctx.enqueue_create_buffer[dtype](y_count)
+
+    with ctx.push_context():
+        ctx.enqueue_copy(c_device, c_h.ptr)
+        ctx.enqueue_copy(ent_device, ent_h.ptr)
+        ctx.enqueue_copy(a_device, a_h.ptr)
+        ctx.enqueue_copy(yd_device, yd_h.ptr)
+
+    var c_tt = TileTensor(
+        c_device, row_major(batch, n_chunks, n_heads, chunk_len, state_dim)
+    )
+    var ent_tt = TileTensor(
+        ent_device, row_major(batch, n_chunks, n_heads, head_dim, state_dim)
+    )
+    var a_tt = TileTensor(
+        a_device, row_major(batch, n_chunks, n_heads, chunk_len)
+    )
+    var yd_tt = TileTensor(
+        yd_device, row_major(batch, n_chunks, n_heads, chunk_len, head_dim)
+    )
+    var y_tt = TileTensor(
+        y_device, row_major(batch, n_chunks, n_heads, chunk_len, head_dim)
+    )
+
+    comptime if use_fused:
+        ssd_output_recombination_fwd_gpu_fused[
+            dtype,
+            chunk_len,
+            state_dim,
+            head_dim,
+            c_tt.LayoutType,
+            ent_tt.LayoutType,
+            a_tt.LayoutType,
+            yd_tt.LayoutType,
+            y_tt.LayoutType,
+        ](batch, n_chunks, n_heads, c_tt, ent_tt, a_tt, yd_tt, y_tt, ctx)
+    else:
+        ssd_output_recombination_fwd_gpu_static[
+            dtype,
+            chunk_len,
+            state_dim,
+            head_dim,
+            c_tt.LayoutType,
+            ent_tt.LayoutType,
+            a_tt.LayoutType,
+            yd_tt.LayoutType,
+            y_tt.LayoutType,
+        ](batch, n_chunks, n_heads, c_tt, ent_tt, a_tt, yd_tt, y_tt, ctx)
+
+    with ctx.push_context():
+        ctx.enqueue_copy(y_gpu_heap, y_device)
+    ctx.synchronize()
+
+    # ── CPU reference: naive output recombination ────────────────────────────
+    var ref_y = ctx.enqueue_create_host_buffer[dtype](y_count)
+    var c_l_stride = state_dim
+    var c_h_stride = chunk_len * c_l_stride
+    var c_c_stride = n_heads * c_h_stride
+    var c_b_stride = n_chunks * c_c_stride
+    var ent_p_stride = state_dim
+    var ent_h_stride = head_dim * ent_p_stride
+    var ent_c_stride = n_heads * ent_h_stride
+    var ent_b_stride = n_chunks * ent_c_stride
+    var a_h_stride = chunk_len
+    var a_c_stride = n_heads * a_h_stride
+    var a_b_stride = n_chunks * a_c_stride
+    var y_l_stride = head_dim
+    var y_h_stride = chunk_len * y_l_stride
+    var y_c_stride = n_heads * y_h_stride
+    var y_b_stride = n_chunks * y_c_stride
+
+    for b in range(batch):
+        for c in range(n_chunks):
+            for h in range(n_heads):
+                var a_base = b * a_b_stride + c * a_c_stride + h * a_h_stride
+                var c_base = b * c_b_stride + c * c_c_stride + h * c_h_stride
+                var ent_base = (
+                    b * ent_b_stride + c * ent_c_stride + h * ent_h_stride
+                )
+                var y_base = b * y_b_stride + c * y_c_stride + h * y_h_stride
+                var a_cumsum = Float32(0.0)
+                for l in range(chunk_len):
+                    a_cumsum += a_h.ptr[a_base + l].cast[DType.float32]()
+                    var decay = exp(a_cumsum)
+                    for p in range(head_dim):
+                        var acc = Float32(0.0)
+                        for n in range(state_dim):
+                            var c_val = c_h.ptr[
+                                c_base + l * c_l_stride + n
+                            ].cast[DType.float32]()
+                            var ent_val = ent_h.ptr[
+                                ent_base + p * ent_p_stride + n
+                            ].cast[DType.float32]()
+                            acc += c_val * ent_val
+                        var yd_val = yd_h.ptr[y_base + l * y_l_stride + p].cast[
+                            DType.float32
+                        ]()
+                        ref_y[y_base + l * y_l_stride + p] = Scalar[dtype](
+                            yd_val + decay * acc
+                        )
+
+    for i in range(y_count):
+        assert_almost_equal(y_gpu_heap[i], ref_y[i], rtol=rtol)
+
+
+def test_ssd_output_recombination_gpu_static_golden() raises:
+    """Static tensor-core path vs naive reference, gate-hitting dims."""
+    var ctx = DeviceContext()
+    run_ssd_output_recombination_gpu_static[
+        DType.float32, chunk_len=128, head_dim=64, state_dim=128
+    ](batch=1, n_chunks=2, n_heads=2, ctx=ctx)
+
+
+def test_ssd_output_recombination_gpu_static_mamba2() raises:
+    """Static path at the Mamba2-130m prefill profile (L=256, P=64, N=128)."""
+    var ctx = DeviceContext()
+    run_ssd_output_recombination_gpu_static[
+        DType.float32, chunk_len=256, head_dim=64, state_dim=128
+    ](batch=1, n_chunks=2, n_heads=4, ctx=ctx)
+
+
+def test_ssd_output_recombination_gpu_fused_golden() raises:
+    """Fused single-pass MMA path vs naive reference, gate-hitting dims."""
+    var ctx = DeviceContext()
+    run_ssd_output_recombination_gpu_static[
+        DType.float32,
+        chunk_len=128,
+        head_dim=64,
+        state_dim=128,
+        use_fused=True,
+    ](batch=1, n_chunks=2, n_heads=2, ctx=ctx)
+
+
+def test_ssd_output_recombination_gpu_fused_mamba2() raises:
+    """Fused path at the Mamba2-130m prefill profile (L=256, P=64, N=128)."""
+    var ctx = DeviceContext()
+    run_ssd_output_recombination_gpu_static[
+        DType.float32,
+        chunk_len=256,
+        head_dim=64,
+        state_dim=128,
+        use_fused=True,
+    ](batch=1, n_chunks=2, n_heads=4, ctx=ctx)
 
 
 def main() raises:

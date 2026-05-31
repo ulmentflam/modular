@@ -77,6 +77,7 @@ from state_space.ssd_chunk_scan import (
 from state_space.ssd_chunk_combine import (
     ssd_output_recombination_fwd_cpu,
     ssd_output_recombination_fwd_gpu,
+    ssd_output_recombination_fwd_gpu_fused,
 )
 
 # Block size for the elementwise precompute/postprocess and the scan/combine
@@ -816,35 +817,67 @@ def _ssd_chunk_scan_combined_gpu[
             block_dim=(_SSD_GPU_BLOCK,),
         )
 
-    # Stage 4: output recombination (device kernel).
+    # Stage 4: output recombination (device kernel). Fused single-pass
+    # tensor-core path for the gate dims (head_dim=64, state_dim=128); the
+    # fused path needs chunk_size a multiple of 128 (comptime tiling), so guard
+    # its instantiation at compile time. Scalar fallback otherwise.
     var comb_total = batch * n_chunks * n_heads * chunk_size * head_dim
-    var comb_compiled = ctx.compile_function[
-        ssd_output_recombination_fwd_gpu[
-            dtype,
-            C_chunk.LayoutType,
-            entering.LayoutType,
-            A_disc.LayoutType,
-            Y_diag.LayoutType,
-            Y_chunked.LayoutType,
-        ]
-    ]()
-    with ctx.push_context():
-        ctx.enqueue_function(
-            comb_compiled,
-            batch,
-            n_chunks,
-            n_heads,
-            chunk_size,
-            head_dim,
-            state_dim,
-            C_chunk,
-            entering,
-            A_disc,
-            Y_diag,
-            Y_chunked,
-            grid_dim=(ceildiv(comb_total, _SSD_GPU_BLOCK),),
-            block_dim=(_SSD_GPU_BLOCK,),
-        )
+    var used_fused = False
+
+    @parameter
+    if chunk_size % 128 == 0:
+        if state_dim == 128 and head_dim == 64:
+            used_fused = True
+            ssd_output_recombination_fwd_gpu_fused[
+                dtype,
+                chunk_size,
+                128,
+                64,
+                C_chunk.LayoutType,
+                entering.LayoutType,
+                A_disc.LayoutType,
+                Y_diag.LayoutType,
+                Y_chunked.LayoutType,
+            ](
+                batch,
+                n_chunks,
+                n_heads,
+                C_chunk,
+                entering,
+                A_disc,
+                Y_diag,
+                Y_chunked,
+                ctx,
+            )
+
+    if not used_fused:
+        var comb_compiled = ctx.compile_function[
+            ssd_output_recombination_fwd_gpu[
+                dtype,
+                C_chunk.LayoutType,
+                entering.LayoutType,
+                A_disc.LayoutType,
+                Y_diag.LayoutType,
+                Y_chunked.LayoutType,
+            ]
+        ]()
+        with ctx.push_context():
+            ctx.enqueue_function(
+                comb_compiled,
+                batch,
+                n_chunks,
+                n_heads,
+                chunk_size,
+                head_dim,
+                state_dim,
+                C_chunk,
+                entering,
+                A_disc,
+                Y_diag,
+                Y_chunked,
+                grid_dim=(ceildiv(comb_total, _SSD_GPU_BLOCK),),
+                block_dim=(_SSD_GPU_BLOCK,),
+            )
 
     # Stage 5: postprocess (un-chunk) + copy final state to the output buffer.
     var post_compiled = ctx.compile_function[

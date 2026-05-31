@@ -45,18 +45,48 @@ which each thread recomputes up to its own ``l`` (``l`` is at most the chunk
 length, so this is cheap and avoids any cross-thread synchronization).
 """
 
-from layout import Layout, LayoutTensor, TensorLayout, TileTensor
-from std.math import exp
+from layout import (
+    Idx,
+    Layout,
+    LayoutTensor,
+    TensorLayout,
+    TileTensor,
+    row_major,
+)
+from layout.layout_tensor import copy_local_to_dram
+from layout.tensor_core import TensorCore, get_fragment_size, get_mma_shape
+from std.math import ceildiv, exp
 from std.gpu import (
+    WARP_SIZE,
+    barrier as gpu_barrier,
     block_dim_uint as block_dim,
     block_idx_uint as block_idx,
     thread_idx_uint as thread_idx,
 )
+from std.gpu.host import DeviceContext
+from std.gpu.memory import AddressSpace
+from std.memory import stack_allocation as mem_stack_allocation
 from std.utils.index import IndexList
+from linalg.bmm import batched_matmul
+
+# ── Fused single-pass MMA tiling (Mamba2 profile, tuned to mirror stage 2) ──
+# Output tile is the whole [L, P] per slice; warps tile it WARPS_M x WARPS_N.
+# block_dim = WARPS_M * WARPS_N * WARP_SIZE must be >= chunk_len for the
+# shared-memory decay scan. 8x1 warps = 256 threads covers chunk_len=256.
+comptime COMBINE_FUSED_WARPS_M = 8
+comptime COMBINE_FUSED_WARPS_N = 1
+# K (state-dim) step for the fused MMA; multiple of MMA_K (8), divides state_dim.
+comptime COMBINE_FUSED_BK = 16
 
 # Stride helpers for indexing the flat row-major buffers.
 comptime Strides4D = IndexList[4]
 comptime Strides5D = IndexList[5]
+
+# Upper bound on chunk_len for the shared-memory decay scratch (one Float32 per
+# token). The static path launches one block per slice with
+# ``block_dim == chunk_len``, so this also bounds that block size. Mirrors
+# ``STATE_MAX_CHUNK`` in ``ssd_chunk_state.mojo``.
+comptime COMBINE_MAX_CHUNK = 1024
 
 
 def _row_major_strides_4d(d0: Int, d1: Int, d2: Int, d3: Int) -> Strides4D:
@@ -342,3 +372,524 @@ def ssd_output_recombination_fwd_gpu[
     )
     var y_diag_val = Y_diag.ptr[y_off_flat].cast[DType.float32]()
     Y.ptr[y_off_flat] = (y_diag_val + y_off).cast[kernel_dtype]()
+
+
+# ===----------------------------------------------------------------------=== #
+# Static-shape tensor-core path
+# ===----------------------------------------------------------------------=== #
+
+
+def _ssd_combine_decay_gpu[
+    kernel_dtype: DType,
+    a_LT: TensorLayout,
+    decay_LT: TensorLayout,
+](
+    chunk_len: Int,
+    A: TileTensor[kernel_dtype, a_LT, MutAnyOrigin],
+    decay_out: TileTensor[DType.float32, decay_LT, MutAnyOrigin],
+):
+    """Per-token decay ``decay[slice, l] = exp(A_cumsum[l])`` for every slice.
+
+    One block per ``(batch, chunk, head)`` slice (``block_dim == chunk_len``).
+    Computes the inclusive prefix sum of ``A`` over the chunk via a Hillis-Steele
+    scan in shared memory, exponentiates, and writes the per-token decay to a
+    ``[num_slices, chunk_len]`` scratch buffer (read back by the coalesced add
+    kernel). Cheap: ``num_slices * chunk_len`` elements total.
+    """
+    var slice_idx = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+
+    var decay = mem_stack_allocation[
+        COMBINE_MAX_CHUNK, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var a_base = slice_idx * chunk_len
+    if tid < chunk_len:
+        decay[tid] = A.ptr[a_base + tid].cast[DType.float32]()
+    gpu_barrier()
+
+    var offset = 1
+    while offset < chunk_len:
+        var add: Float32 = 0.0
+        if tid < chunk_len and tid >= offset:
+            add = decay[tid - offset]
+        gpu_barrier()
+        if tid < chunk_len and tid >= offset:
+            decay[tid] += add
+        gpu_barrier()
+        offset *= 2
+
+    if tid < chunk_len:
+        decay_out.ptr[a_base + tid] = exp(decay[tid])
+
+
+def _ssd_combine_add_gpu[
+    kernel_dtype: DType,
+    mt_LT: TensorLayout,
+    decay_LT: TensorLayout,
+    y_diag_LT: TensorLayout,
+    y_LT: TensorLayout,
+](
+    chunk_len: Int,
+    head_dim: Int,
+    num_slices: Int,
+    M_T: TileTensor[kernel_dtype, mt_LT, MutAnyOrigin],
+    decay: TileTensor[DType.float32, decay_LT, MutAnyOrigin],
+    Y_diag: TileTensor[kernel_dtype, y_diag_LT, MutAnyOrigin],
+    Y: TileTensor[kernel_dtype, y_LT, MutAnyOrigin],
+):
+    """Coalesced add: ``Y[l, p] = Y_diag[l, p] + decay[l] * M_T[p, l]``.
+
+    Flat element-wise launch -- one thread per ``(slice, l, p)`` output scalar,
+    so the grid has ``num_slices * chunk_len * head_dim`` threads (vs the
+    one-block-per-slice epilogue, which starved GB10's SMs). Consecutive threads
+    own consecutive ``p`` (the contiguous output axis), so both the ``Y_diag``
+    read and the ``Y`` write are coalesced. The transposed ``M_T[p, l]`` read is
+    strided by ``chunk_len`` across ``p`` but L2-resident.
+    """
+    var flat_idx = Int(block_dim.x) * Int(block_idx.x) + Int(thread_idx.x)
+    var total = num_slices * chunk_len * head_dim
+    if flat_idx >= total:
+        return
+
+    var p = flat_idx % head_dim
+    var l = (flat_idx // head_dim) % chunk_len
+    var slice_idx = flat_idx // (head_dim * chunk_len)
+
+    var d = decay.ptr[slice_idx * chunk_len + l]
+    var mt_val = M_T.ptr[
+        slice_idx * head_dim * chunk_len + p * chunk_len + l
+    ].cast[DType.float32]()
+    var y_off = slice_idx * chunk_len * head_dim + l * head_dim + p
+    var yd_val = Y_diag.ptr[y_off].cast[DType.float32]()
+    Y.ptr[y_off] = (yd_val + d * mt_val).cast[kernel_dtype]()
+
+
+def ssd_output_recombination_fwd_gpu_static[
+    kernel_dtype: DType,
+    chunk_len_ct: Int,
+    state_dim_ct: Int,
+    head_dim_ct: Int,
+    c_LT: TensorLayout,
+    entering_LT: TensorLayout,
+    a_LT: TensorLayout,
+    y_diag_LT: TensorLayout,
+    y_LT: TensorLayout,
+](
+    batch: Int,
+    n_chunks: Int,
+    n_heads: Int,
+    C: TileTensor[kernel_dtype, c_LT, MutAnyOrigin],
+    entering_state: TileTensor[kernel_dtype, entering_LT, MutAnyOrigin],
+    A: TileTensor[kernel_dtype, a_LT, MutAnyOrigin],
+    Y_diag: TileTensor[kernel_dtype, y_diag_LT, MutAnyOrigin],
+    Y: TileTensor[kernel_dtype, y_LT, MutAnyOrigin],
+    ctx: DeviceContext,
+) raises:
+    """Static-shape, tensor-core variant of ``ssd_output_recombination_fwd_gpu``.
+
+    Computes the output recombination as a batched matmul on tensor cores
+    followed by a cheap decay + add epilogue:
+
+        ``M_T[p, l] = sum_n entering_state[p, n] * C[l, n]``   (batched_matmul)
+        ``Y[l, p]   = Y_diag[l, p] + exp(A_cumsum[l]) * M_T[p, l]``  (epilogue)
+
+    The decay multiplies an *output* row (``l``), not the reduction dim, so the
+    matmul stays a plain ``entering_state @ Cᵀ`` (``transpose_b=True``, no decay
+    materialisation). Knowing ``chunk_len`` / ``state_dim`` / ``head_dim`` at
+    compile time lets ``batched_matmul`` see ``has_static_NK``; the output has
+    ``chunk_len`` (== matmul ``N``) columns and ``state_dim`` (== ``K``) is a
+    multiple of 32 and ``>= 128``, so it takes the A100 multistage tensor-core
+    batched path (one launch for all ``batch * n_chunks * n_heads`` slices)
+    instead of the scalar reduction in ``ssd_output_recombination_fwd_gpu``.
+
+    The scalar kernel remains the all-shape-correct fallback for shapes that
+    miss the gate (e.g. ``chunk_len`` not a multiple of 128).
+
+    Parameters:
+        kernel_dtype: The element type of every tensor (e.g. ``float32``).
+        chunk_len_ct: Tokens per chunk (``L``), compile-time.
+        state_dim_ct: State dimension (``N``), compile-time.
+        head_dim_ct: Head dimension (``P``), compile-time.
+        c_LT: Layout of the ``C`` tensor.
+        entering_LT: Layout of the ``entering_state`` tensor.
+        a_LT: Layout of the ``A`` tensor.
+        y_diag_LT: Layout of the ``Y_diag`` tensor.
+        y_LT: Layout of the ``Y`` output tensor.
+
+    Args:
+        batch: Number of batch elements.
+        n_chunks: Number of chunks per sequence.
+        n_heads: Number of heads.
+        C: Per-token C projection, shape ``[batch, n_chunks, n_heads, L, N]``.
+        entering_state: State entering this chunk,
+            shape ``[batch, n_chunks, n_heads, P, N]``.
+        A: Per-token in-chunk log-decay,
+            shape ``[batch, n_chunks, n_heads, L]``.
+        Y_diag: Intra-chunk diagonal output,
+            shape ``[batch, n_chunks, n_heads, L, P]``.
+        Y: Output, shape ``[batch, n_chunks, n_heads, L, P]``.
+        ctx: The device context to enqueue work on.
+    """
+    var num_slices = batch * n_chunks * n_heads
+
+    # Scratch for the off-diagonal matmul result, transposed: [num_slices, P, L].
+    var mt_device = ctx.enqueue_create_buffer[kernel_dtype](
+        num_slices * head_dim_ct * chunk_len_ct
+    )
+
+    # Stage 1: M_T[p, l] = entering_state[p, n] @ C[l, n]ᵀ (batched tensor-core
+    # matmul, one launch). Output N == chunk_len (% 128 == 0), K == state_dim
+    # (% 32 == 0, >= 128) hits the A100 multistage path.
+    var ent3 = TileTensor(
+        entering_state.ptr,
+        row_major(num_slices, Idx[head_dim_ct], Idx[state_dim_ct]),
+    )
+    var C3 = TileTensor(
+        C.ptr,
+        row_major(num_slices, Idx[chunk_len_ct], Idx[state_dim_ct]),
+    )
+    var MT3 = TileTensor(
+        mt_device,
+        row_major(num_slices, Idx[head_dim_ct], Idx[chunk_len_ct]),
+    )
+    with ctx.push_context():
+        batched_matmul[target="gpu", transpose_b=True](
+            MT3, ent3, C3, context=ctx
+        )
+
+    var MT_tt = TileTensor(
+        mt_device,
+        row_major(batch, n_chunks, n_heads, head_dim_ct, chunk_len_ct),
+    )
+
+    # Stage 2: per-token decay = exp(A_cumsum) into a [num_slices, L] scratch
+    # (one block per slice, block_dim == L; the only sequential part).
+    var decay_device = ctx.enqueue_create_buffer[DType.float32](
+        num_slices * chunk_len_ct
+    )
+    var decay_tt = TileTensor(
+        decay_device, row_major(batch, n_chunks, n_heads, chunk_len_ct)
+    )
+    var decay_compiled = ctx.compile_function[
+        _ssd_combine_decay_gpu[kernel_dtype, a_LT, decay_tt.LayoutType]
+    ]()
+    with ctx.push_context():
+        ctx.enqueue_function(
+            decay_compiled,
+            chunk_len_ct,
+            A,
+            decay_tt,
+            grid_dim=(num_slices,),
+            block_dim=(chunk_len_ct,),
+        )
+
+    # Stage 3: coalesced add Y[l,p] = Y_diag[l,p] + decay[l] * M_T[p,l]
+    # (flat element-wise launch -- one thread per output, many small blocks).
+    comptime ADD_BLOCK = 256
+    var total_out = num_slices * chunk_len_ct * head_dim_ct
+    var add_compiled = ctx.compile_function[
+        _ssd_combine_add_gpu[
+            kernel_dtype,
+            MT_tt.LayoutType,
+            decay_tt.LayoutType,
+            y_diag_LT,
+            y_LT,
+        ]
+    ]()
+    with ctx.push_context():
+        ctx.enqueue_function(
+            add_compiled,
+            chunk_len_ct,
+            head_dim_ct,
+            num_slices,
+            MT_tt,
+            decay_tt,
+            Y_diag,
+            Y,
+            grid_dim=(ceildiv(total_out, ADD_BLOCK),),
+            block_dim=(ADD_BLOCK,),
+        )
+
+
+# ===----------------------------------------------------------------------=== #
+# Fused single-pass tensor-core path
+# ===----------------------------------------------------------------------=== #
+
+
+def _ssd_combine_fused_mma_gpu[
+    kernel_dtype: DType,
+    L: Int,
+    P: Int,
+    N: Int,
+    BK: Int,
+    num_warps_m: Int,
+    num_warps_n: Int,
+    c_LT: TensorLayout,
+    entering_LT: TensorLayout,
+    a_LT: TensorLayout,
+    y_LT: TensorLayout,
+](
+    C: TileTensor[kernel_dtype, c_LT, MutAnyOrigin],
+    entering_state: TileTensor[kernel_dtype, entering_LT, MutAnyOrigin],
+    A: TileTensor[kernel_dtype, a_LT, MutAnyOrigin],
+    Y: TileTensor[kernel_dtype, y_LT, MutAnyOrigin],
+):
+    """Fused, single-pass tensor-core off-diagonal recombination (one block/slice).
+
+    Computes ``M[l,p] = decay[l] * sum_n C[l,n] * entering_state[p,n]`` for one
+    ``(batch, chunk, head)`` slice as a transpose-of-entering tensor-core GEMM,
+    **without** materialising the matmul result in DRAM (the cost the 2-pass
+    ``..._fwd_gpu_static`` pays). Per K-tile the block streams ``C``/``entering``
+    once, folds ``decay[l]`` into the ``C`` (``As``) tile while loading (so the
+    decay is on the matmul ``M`` rows, no post-pass), transposes ``entering``
+    into the ``Bs`` tile, and accumulates the warp-tiled MMA. The decayed
+    ``M[l,p]`` is written to ``Y``; the small ``+ Y_diag`` is a separate
+    same-layout coalesced add (``_ssd_combine_add_diag_gpu``).
+
+    Compile-time tiling: block tile is the whole ``[L, P]`` output; warps tile it
+    ``num_warps_m x num_warps_n``; ``BK`` is the K (state-dim) step. Slices are
+    contiguous in every buffer, so ``slice_idx`` alone indexes them. Mirrors
+    ``_ssd_chunk_state_fused_mma_gpu`` in ``ssd_chunk_state.mojo``.
+    """
+    comptime accum_type = DType.float32
+    comptime mma_shape = get_mma_shape[kernel_dtype, accum_type]()
+    comptime MMA_M = mma_shape[0]
+    comptime MMA_N = mma_shape[1]
+    comptime MMA_K = mma_shape[2]
+    comptime WM = L // num_warps_m
+    comptime WN = P // num_warps_n
+    comptime num_m_mmas = WM // MMA_M
+    comptime num_n_mmas = WN // MMA_N
+    comptime num_k_mmas = BK // MMA_K
+    comptime fs = get_fragment_size[mma_shape]()
+    comptime a_frag_size = fs[0]
+    comptime b_frag_size = fs[1]
+    comptime c_frag_size = fs[2]
+    comptime num_threads = num_warps_m * num_warps_n * WARP_SIZE
+
+    var slice_idx = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var warp_id = tid // WARP_SIZE
+    var warp_y = warp_id // num_warps_n
+    var warp_x = warp_id % num_warps_n
+
+    var c_base = slice_idx * L * N
+    var ent_base = slice_idx * P * N
+    var a_base = slice_idx * L
+    var y_base = slice_idx * L * P
+
+    # ── Per-token decay into shared memory (Hillis-Steele, then exp). ─────────
+    # Stage 4 uses exp(A_cumsum[l]) directly (inclusive prefix sum, no cum_end).
+    var decay = mem_stack_allocation[
+        COMBINE_MAX_CHUNK, Float32, address_space=AddressSpace.SHARED
+    ]()
+    if tid < L:
+        decay[tid] = A.ptr[a_base + tid].cast[DType.float32]()
+    gpu_barrier()
+    var offset = 1
+    while offset < L:
+        var add: Float32 = 0.0
+        if tid < L and tid >= offset:
+            add = decay[tid - offset]
+        gpu_barrier()
+        if tid < L and tid >= offset:
+            decay[tid] += add
+        gpu_barrier()
+        offset *= 2
+    if tid < L:
+        decay[tid] = exp(decay[tid])
+    gpu_barrier()
+
+    # ── Shared tiles: As is decay-scaled C [L, BK]; Bs is entering transposed
+    # to [BK, P]. ─────────────────────────────────────────────────────────────
+    var As = LayoutTensor[
+        kernel_dtype,
+        Layout.row_major(L, BK),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+    var Bs = LayoutTensor[
+        kernel_dtype,
+        Layout.row_major(BK, P),
+        MutAnyOrigin,
+        address_space=AddressSpace.SHARED,
+    ].stack_allocation()
+
+    var c_reg = (
+        LayoutTensor[
+            accum_type,
+            Layout.row_major(num_m_mmas * num_n_mmas, c_frag_size),
+            MutAnyOrigin,
+            address_space=AddressSpace.LOCAL,
+        ]
+        .stack_allocation()
+        .fill(0)
+    )
+    var a_reg = LayoutTensor[
+        kernel_dtype,
+        Layout.row_major(num_m_mmas, a_frag_size),
+        MutAnyOrigin,
+        address_space=AddressSpace.LOCAL,
+    ].stack_allocation()
+    var b_reg = LayoutTensor[
+        kernel_dtype,
+        Layout.row_major(num_n_mmas, b_frag_size),
+        MutAnyOrigin,
+        address_space=AddressSpace.LOCAL,
+    ].stack_allocation()
+
+    var mma_op = TensorCore[accum_type, kernel_dtype, mma_shape, False]()
+
+    # ── K-loop over the state dimension N ────────────────────────────────────
+    var k0 = 0
+    while k0 < N:
+        # As[l, kl] = decay[l] * C[l, k0+kl] (coalesced read over kl per row l).
+        var idx = tid
+        while idx < L * BK:
+            var l = idx // BK
+            var kl = idx % BK
+            As[l, kl] = (
+                decay[l]
+                * C.ptr[c_base + l * N + (k0 + kl)].cast[DType.float32]()
+            ).cast[kernel_dtype]()
+            idx += num_threads
+        # Bs[kl, p] = entering[p, k0+kl] (coalesced read over kl per row p).
+        idx = tid
+        while idx < P * BK:
+            var p = idx // BK
+            var kl = idx % BK
+            Bs[kl, p] = entering_state.ptr[ent_base + p * N + (k0 + kl)]
+            idx += num_threads
+        gpu_barrier()
+
+        var a_warp_tile = As.tile[WM, BK](warp_y, 0)
+        var b_warp_tile = Bs.tile[BK, WN](0, warp_x)
+
+        comptime for k_mma in range(num_k_mmas):
+            mma_op.load_a(a_warp_tile, a_reg.vectorize[1, a_frag_size](), k_mma)
+            mma_op.load_b(
+                b_warp_tile, b_reg.vectorize[1, b_frag_size](), k_mma, warp_x
+            )
+            mma_op.mma(
+                a_reg.vectorize[1, a_frag_size](),
+                b_reg.vectorize[1, b_frag_size](),
+                c_reg.vectorize[1, c_frag_size](),
+            )
+        gpu_barrier()
+        k0 += BK
+
+    # ── Store the warp's [WM, WN] output tile (decayed M) to Y. ──────────────
+    var y_slice = LayoutTensor[
+        kernel_dtype, Layout.row_major(L, P), MutAnyOrigin
+    ](Y.ptr + y_base)
+    var y_warp_tile = y_slice.tile[WM, WN](warp_y, warp_x)
+    copy_local_to_dram[dst_thread_layout=Layout.row_major(8, 4)](
+        y_warp_tile.vectorize[1, 2](),
+        c_reg.vectorize[1, 2]().transpose(),
+    )
+
+
+def _ssd_combine_add_diag_gpu[
+    kernel_dtype: DType,
+    y_diag_LT: TensorLayout,
+    y_LT: TensorLayout,
+](
+    total: Int,
+    Y_diag: TileTensor[kernel_dtype, y_diag_LT, MutAnyOrigin],
+    Y: TileTensor[kernel_dtype, y_LT, MutAnyOrigin],
+):
+    """Coalesced ``Y[i] += Y_diag[i]`` over every output scalar.
+
+    Both tensors are the same row-major ``[b,nc,h,L,P]`` layout, so this is a
+    fully-coalesced element-wise add (no transpose) — far cheaper than the
+    transposed-read add of the 2-pass static path.
+    """
+    var i = Int(block_dim.x) * Int(block_idx.x) + Int(thread_idx.x)
+    if i >= total:
+        return
+    Y.ptr[i] = (
+        Y.ptr[i].cast[DType.float32]() + Y_diag.ptr[i].cast[DType.float32]()
+    ).cast[kernel_dtype]()
+
+
+def ssd_output_recombination_fwd_gpu_fused[
+    kernel_dtype: DType,
+    chunk_len_ct: Int,
+    state_dim_ct: Int,
+    head_dim_ct: Int,
+    c_LT: TensorLayout,
+    entering_LT: TensorLayout,
+    a_LT: TensorLayout,
+    y_diag_LT: TensorLayout,
+    y_LT: TensorLayout,
+](
+    batch: Int,
+    n_chunks: Int,
+    n_heads: Int,
+    C: TileTensor[kernel_dtype, c_LT, MutAnyOrigin],
+    entering_state: TileTensor[kernel_dtype, entering_LT, MutAnyOrigin],
+    A: TileTensor[kernel_dtype, a_LT, MutAnyOrigin],
+    Y_diag: TileTensor[kernel_dtype, y_diag_LT, MutAnyOrigin],
+    Y: TileTensor[kernel_dtype, y_LT, MutAnyOrigin],
+    ctx: DeviceContext,
+) raises:
+    """Fused single-pass tensor-core variant of the stage-4 recombination.
+
+    One block per slice runs ``_ssd_combine_fused_mma_gpu`` (decay folded into
+    the matmul, no DRAM round-trip for the off-diagonal result), then a
+    coalesced ``Y += Y_diag`` add. Faster than the 2-pass
+    ``..._fwd_gpu_static`` (which round-trips ``M_T`` through DRAM and does a
+    transposed-read add).
+
+    Requires the fused-MMA tiling constraints: ``chunk_len % (16*num_warps_m)
+    == 0``, ``head_dim % (8*num_warps_n) == 0``, ``state_dim % BK == 0``, and
+    the launch block (``num_warps_m*num_warps_n*32`` threads) ``>= chunk_len``
+    for the decay scan. The 2-pass static path is the fallback for other shapes.
+    """
+    comptime num_threads = (
+        COMBINE_FUSED_WARPS_M * COMBINE_FUSED_WARPS_N * WARP_SIZE
+    )
+    var num_slices = batch * n_chunks * n_heads
+
+    # Stage 1: fused MMA writes the decayed off-diagonal M[l,p] into Y.
+    var fused_compiled = ctx.compile_function[
+        _ssd_combine_fused_mma_gpu[
+            kernel_dtype,
+            chunk_len_ct,
+            head_dim_ct,
+            state_dim_ct,
+            COMBINE_FUSED_BK,
+            COMBINE_FUSED_WARPS_M,
+            COMBINE_FUSED_WARPS_N,
+            c_LT,
+            entering_LT,
+            a_LT,
+            y_LT,
+        ]
+    ]()
+    with ctx.push_context():
+        ctx.enqueue_function(
+            fused_compiled,
+            C,
+            entering_state,
+            A,
+            Y,
+            grid_dim=(num_slices,),
+            block_dim=(num_threads,),
+        )
+
+    # Stage 2: coalesced Y += Y_diag (same layout, no transpose).
+    comptime ADD_BLOCK = 256
+    var total_out = num_slices * chunk_len_ct * head_dim_ct
+    var add_compiled = ctx.compile_function[
+        _ssd_combine_add_diag_gpu[kernel_dtype, y_diag_LT, y_LT]
+    ]()
+    with ctx.push_context():
+        ctx.enqueue_function(
+            add_compiled,
+            total_out,
+            Y_diag,
+            Y,
+            grid_dim=(ceildiv(total_out, ADD_BLOCK),),
+            block_dim=(ADD_BLOCK,),
+        )
